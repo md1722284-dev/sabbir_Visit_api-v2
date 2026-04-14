@@ -1,75 +1,51 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 import aiohttp
 import asyncio
 import json
 from byte import encrypt_api, Encrypt_ID
-from visit_count_pb2 import Info
 
 app = Flask(__name__)
 
-# টোকেন লোড করার ফাংশন (আপনার আগের লজিক অনুযায়ী)
-def load_tokens(server_name):
+# টোকেন লোড করার ফাংশন
+def load_tokens():
     try:
-        path = "token_ind.json" if server_name == "IND" else "token_br.json" if server_name in {"BR", "US", "SAC", "NA"} else "token_bd.json"
-        with open(path, "r") as f:
+        with open("token_bd.json", "r") as f:
             data = json.load(f)
-        return [item["token"] for item in data if "token" in item and item["token"] not in ["", "N/A"]]
-    except Exception:
-        return []
+        return [item["token"] for item in data if "token" in item]
+    except: return []
 
-def get_url(server_name):
-    if server_name == "IND":
-        return "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        return "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-    else:
-        return "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
-
-# ভিজিট পাঠানোর মূল ফাংশন
 async def visit(session, url, token, uid, data, sem):
     headers = {
         "ReleaseVersion": "OB53",
         "Authorization": f"Bearer {token}",
-        "Host": url.replace("https://", "").split("/")[0],
+        "Host": "clientbp.ggblueshark.com",
         "Connection": "keep-alive"
     }
     async with sem:
         try:
-            async with session.post(url, headers=headers, data=data, ssl=False, timeout=10) as resp:
+            async with session.post(url, headers=headers, data=data, ssl=False, timeout=5) as resp:
                 return resp.status == 200
-        except:
-            return False
+        except: return False
 
-@app.route('/<string:server>/<int:uid>')
-async def send_visits(server, uid):
-    server = server.upper()
-    tokens = load_tokens(server)
-    
-    if not tokens:
-        return jsonify({"error": "No tokens found"}), 500
+@app.route('/<int:uid>')
+async def send_visits(uid):
+    tokens = load_tokens()
+    if not tokens: return jsonify({"error": "No tokens"}), 500
 
-    target = 1000  # ১০০০ লিমিট
-    url = get_url(server)
+    url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
+    target = 1000 # Vercel-এর জন্য ১০০০ পারফেক্ট
     
-    # এনক্রিপশন একবারই করা হচ্ছে
     encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
     payload = bytes.fromhex(encrypted)
-    
-    # সেমাফোর দিয়ে কনকারেন্সি কন্ট্রোল
-    sem = asyncio.Semaphore(100) 
+    sem = asyncio.Semaphore(200) # স্পিড বাড়ানোর জন্য ২০০ সেমাফোর
 
     async with aiohttp.ClientSession() as session:
         tasks = [visit(session, url, tokens[i % len(tokens)], uid, payload, sem) for i in range(target)]
         results = await asyncio.gather(*tasks)
     
-    success_count = sum(1 for r in results if r)
-    
-    return jsonify({
-        "status": "Success",
-        "uid": uid,
-        "success": success_count,
-        "failed": target - success_count
-    })
+    success = sum(1 for r in results if r)
+    return jsonify({"uid": uid, "success": success, "limit": target})
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5100)
+# Vercel-এর জন্য এটি প্রয়োজন
+def handler(event, context):
+    return app(event, context)
