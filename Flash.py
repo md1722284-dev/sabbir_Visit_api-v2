@@ -1,24 +1,41 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import aiohttp
 import asyncio
+import json
 from byte import encrypt_api, Encrypt_ID
-# আপনার অন্যান্য ইমপোর্টগুলো ঠিক থাকবে...
+from visit_count_pb2 import Info
 
 app = Flask(__name__)
 
-# একসাথে ১০০টি করে রিকোয়েস্ট প্রসেস হবে (Vercel-এর জন্য পারফেক্ট)
-semaphore = asyncio.Semaphore(100)
+# টোকেন লোড করার ফাংশন (আপনার আগের লজিক অনুযায়ী)
+def load_tokens(server_name):
+    try:
+        path = "token_ind.json" if server_name == "IND" else "token_br.json" if server_name in {"BR", "US", "SAC", "NA"} else "token_bd.json"
+        with open(path, "r") as f:
+            data = json.load(f)
+        return [item["token"] for item in data if "token" in item and item["token"] not in ["", "N/A"]]
+    except Exception:
+        return []
 
-async def visit(session, url, token, uid, data):
+def get_url(server_name):
+    if server_name == "IND":
+        return "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+    elif server_name in {"BR", "US", "SAC", "NA"}:
+        return "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
+    else:
+        return "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
+
+# ভিজিট পাঠানোর মূল ফাংশন
+async def visit(session, url, token, uid, data, sem):
     headers = {
         "ReleaseVersion": "OB53",
         "Authorization": f"Bearer {token}",
-        "Host": url.replace("https://", "").split("/")[0]
+        "Host": url.replace("https://", "").split("/")[0],
+        "Connection": "keep-alive"
     }
-    async with semaphore:
+    async with sem:
         try:
-            # টাইমআউট ৫ সেকেন্ড রাখলে Vercel-এ এরর কম আসবে
-            async with session.post(url, headers=headers, data=data, ssl=False, timeout=5) as resp:
+            async with session.post(url, headers=headers, data=data, ssl=False, timeout=10) as resp:
                 return resp.status == 200
         except:
             return False
@@ -26,21 +43,23 @@ async def visit(session, url, token, uid, data):
 @app.route('/<string:server>/<int:uid>')
 async def send_visits(server, uid):
     server = server.upper()
-    tokens = load_tokens(server) # আপনার টোকেন লোড ফাংশন
+    tokens = load_tokens(server)
     
     if not tokens:
         return jsonify({"error": "No tokens found"}), 500
 
-    target = 1000  # এখানে আমরা ১০০০ লিমিট ফিক্সড করে দিলাম
+    target = 1000  # ১০০০ লিমিট
     url = get_url(server)
     
-    # এনক্রিপশন লজিক
+    # এনক্রিপশন একবারই করা হচ্ছে
     encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
-    data = bytes.fromhex(encrypted)
+    payload = bytes.fromhex(encrypted)
+    
+    # সেমাফোর দিয়ে কনকারেন্সি কন্ট্রোল
+    sem = asyncio.Semaphore(100) 
 
     async with aiohttp.ClientSession() as session:
-        # ১০০০টি টাস্ক তৈরি করা হচ্ছে
-        tasks = [visit(session, url, tokens[i % len(tokens)], uid, data) for i in range(target)]
+        tasks = [visit(session, url, tokens[i % len(tokens)], uid, payload, sem) for i in range(target)]
         results = await asyncio.gather(*tasks)
     
     success_count = sum(1 for r in results if r)
@@ -48,7 +67,9 @@ async def send_visits(server, uid):
     return jsonify({
         "status": "Success",
         "uid": uid,
-        "sent": target,
         "success": success_count,
-        "fail": target - success_count
+        "failed": target - success_count
     })
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5100)
