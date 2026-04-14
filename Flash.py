@@ -2,49 +2,73 @@ from flask import Flask, jsonify
 import aiohttp
 import asyncio
 import json
+import os
 from byte import encrypt_api, Encrypt_ID
 
 app = Flask(__name__)
 
-# টেস্টিং ফাংশন: ভিজিট কাজ করছে কি না দেখার জন্য
-async def single_visit(uid):
-    # token_bd.json থেকে প্রথম টোকেনটি নেওয়া
+# টোকেন লোড করার ফাংশন
+def load_tokens():
     try:
-        with open("token_bd.json", "r") as f:
-            tokens = json.load(f)
-            token = tokens[0]["token"]
+        # Vercel-এ ফাইল পাথ ঠিক রাখতে
+        path = os.path.join(os.path.dirname(__file__), 'token_bd.json')
+        with open(path, "r") as f:
+            data = json.load(f)
+        return [item["token"] for item in data if "token" in item and item["token"] != ""]
     except:
-        return "Token Error: token_bd.json ফাইলটি চেক করুন"
+        return []
 
-    url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
-    encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
-    payload = bytes.fromhex(encrypted)
-    
+# ভিজিট পাঠানোর ফাংশন
+async def visit_task(session, url, token, payload, sem):
     headers = {
         "ReleaseVersion": "OB53",
         "Authorization": f"Bearer {token}",
-        "Host": "clientbp.ggblueshark.com"
+        "Host": "clientbp.ggblueshark.com",
+        "Connection": "keep-alive"
     }
+    async with sem:
+        try:
+            async with session.post(url, headers=headers, data=payload, ssl=False, timeout=5) as resp:
+                return resp.status == 200
+        except:
+            return False
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, data=payload, ssl=False) as resp:
-            return resp.status
-
-# মেইন রুট
 @app.route('/')
 def home():
-    return "<h1>Vercel Testing Bot is Running!</h1>"
+    return "<h1>Vercel High-Speed Visit Bot is Live!</h1>"
 
-# চেক করার জন্য রুট: /test/UID
-@app.route('/test/<int:uid>')
-async def test_route(uid):
-    # সরাসরি await ব্যবহার করা হয়েছে, যা flask[async] এ কাজ করবে
-    status = await single_visit(uid)
+@app.route('/visit/<int:uid>')
+async def send_visits(uid):
+    tokens = load_tokens()
+    if not tokens:
+        return jsonify({"error": "token_bd.json ফাইলে কোনো টোকেন পাওয়া যায়নি!"}), 500
+
+    url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
+    target = 1000 # Vercel-এর জন্য ১০০০ লিমিট পারফেক্ট
+    
+    # এনক্রিপশন লজিক
+    try:
+        encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
+        payload = bytes.fromhex(encrypted)
+    except Exception as e:
+        return jsonify({"error": f"Encryption failed: {str(e)}"}), 500
+
+    # সেমাফোর ২০০ রাখা হয়েছে যাতে দ্রুত কাজ শেষ হয়
+    sem = asyncio.Semaphore(200)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for i in range(target):
+            token = tokens[i % len(tokens)]
+            tasks.append(visit_task(session, url, token, payload, sem))
+        
+        results = await asyncio.gather(*tasks)
+    
+    success = sum(1 for r in results if r)
     return jsonify({
+        "status": "Success",
         "uid": uid,
-        "http_status": status,
-        "message": "সাকসেস!" if status == 200 else "ফেইল (টোকেন সমস্যা হতে পারে)"
+        "sent": target,
+        "success": success,
+        "failed": target - success
     })
-
-if __name__ == "__main__":
-    app.run()
