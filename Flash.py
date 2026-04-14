@@ -1,138 +1,74 @@
-from flask import Flask, jsonify
-import aiohttp
 import asyncio
+import aiohttp
 import json
+from flask import Flask, jsonify
 from byte import encrypt_api, Encrypt_ID
-from visit_count_pb2 import Info  # Import the generated protobuf class
 
 app = Flask(__name__)
 
-def load_tokens(server_name):
-    try:
-        if server_name == "IND":
-            path = "token_ind.json"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_br.json"
-        else:
-            path = "token_bd.json"
-
-        with open(path, "r") as f:
-            data = json.load(f)
-
-        tokens = [item["token"] for item in data if "token" in item and item["token"] not in ["", "N/A"]]
-        return tokens
-    except Exception as e:
-        app.logger.error(f"❌ Token load error for {server_name}: {e}")
-        return []
-
-def get_url(server_name):
-    if server_name == "IND":
-        return "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        return "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-    else:
-        return "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
-
-def parse_protobuf_response(response_data):
-    try:
-        info = Info()
-        info.ParseFromString(response_data)
-        
-        player_data = {
-            "uid": info.AccountInfo.UID if info.AccountInfo.UID else 0,
-            "nickname": info.AccountInfo.PlayerNickname if info.AccountInfo.PlayerNickname else "",
-            "likes": info.AccountInfo.Likes if info.AccountInfo.Likes else 0,
-            "region": info.AccountInfo.PlayerRegion if info.AccountInfo.PlayerRegion else "",
-            "level": info.AccountInfo.Levels if info.AccountInfo.Levels else 0
-        }
-        return player_data
-    except Exception as e:
-        app.logger.error(f"❌ Protobuf parsing error: {e}")
-        return None
+# সেমাফোর: একসাথে সর্বোচ্চ ৫০০টি রিকোয়েস্ট বের হবে (সার্ভার ভেদে ১০০০ পর্যন্ত করা যায়)
+MAX_CONCURRENT_REQUESTS = 500
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 async def visit(session, url, token, uid, data):
     headers = {
         "ReleaseVersion": "OB53",
-        "X-GA": "v1 1",
         "Authorization": f"Bearer {token}",
-        "Host": url.replace("https://", "").split("/")[0]
+        "Host": url.replace("https://", "").split("/")[0],
+        "Connection": "keep-alive" # কানেকশন ধরে রাখার জন্য
     }
-    try:
-        async with session.post(url, headers=headers, data=data, ssl=False) as resp:
-            if resp.status == 200:
-                response_data = await resp.read()
-                return True, response_data
-            else:
-                return False, None
-    except Exception as e:
-        app.logger.error(f"❌ Visit error: {e}")
-        return False, None
+    async with semaphore: # সেমাফোর কন্ট্রোল
+        try:
+            async with session.post(url, headers=headers, data=data, ssl=False, timeout=10) as resp:
+                return resp.status == 200
+        except:
+            return False
 
-async def send_until_20_success(tokens, uid, server_name, target_success=20000):
+async def run_massive_visits(tokens, uid, server_name, target):
     url = get_url(server_name)
-    connector = aiohttp.TCPConnector(limit=0)
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, ttl_dns_cache=300)
+    
+    # ডেটা একবারই এনক্রিপ্ট করুন (লুপের বাইরে)
+    encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
+    payload = bytes.fromhex(encrypted)
+    
     total_success = 0
-    total_sent = 0
-    first_success_response = None
-    player_info = None
-
     async with aiohttp.ClientSession(connector=connector) as session:
-        encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
-        data = bytes.fromhex(encrypted)
-
-        while total_success < target_success:
-            batch_size = min(target_success - total_success, 2000)
-            tasks = [
-                asyncio.create_task(visit(session, url, tokens[(total_sent + i) % len(tokens)], uid, data))
-                for i in range(batch_size)
-            ]
+        # ৫০০০ করে ব্যাচে ভাগ করে কাজ করা (মেমোরি সেভ করার জন্য)
+        for i in range(0, target, 5000):
+            current_batch_size = min(5000, target - i)
+            tasks = []
+            
+            for j in range(current_batch_size):
+                token = tokens[(i + j) % len(tokens)]
+                tasks.append(visit(session, url, token, uid, payload))
+            
+            # ব্যাচ রান করা
             results = await asyncio.gather(*tasks)
+            total_success += sum(1 for r in results if r)
             
-            if first_success_response is None:
-                for success, response in results:
-                    if success and response is not None:
-                        first_success_response = response
-                        player_info = parse_protobuf_response(response)
-                        break
+            print(f"Progress: {total_success}/{target} visits done...")
             
-            batch_success = sum(1 for r, _ in results if r)
-            total_success += batch_success
-            total_sent += batch_size
+    return total_success
 
-            print(f"Batch sent: {batch_size}, Success in batch: {batch_success}, Total success so far: {total_success}")
-
-    return total_success, total_sent, player_info
-
-@app.route('/<string:server>/<int:uid>', methods=['GET'])
-def send_visits(server, uid):
+@app.route('/visit/<string:server>/<int:uid>/<int:count>')
+async def handle_request(server, uid, count):
+    # ১ লাখ ভিজিটের জন্য count প্যারামিটার ব্যবহার করুন
     server = server.upper()
     tokens = load_tokens(server)
-    target_success = 2000
-
+    
     if not tokens:
-        return jsonify({"error": "❌ No valid tokens found"}), 500
+        return jsonify({"error": "No tokens found"}), 500
 
-    print(f"🚀 Sending visits to UID: {uid} using {len(tokens)} tokens")
-    print(f"Waiting for total {target_success} successful visits...")
+    # ব্যাকগ্রাউন্ডে কাজ শুরু করা (বড় রিকোয়েস্টের জন্য)
+    # নোট: ১ লাখের জন্য এটি কয়েক মিনিট সময় নেবে
+    final_success = await run_massive_visits(tokens, uid, server, count)
+    
+    return jsonify({
+        "uid": uid,
+        "target": count,
+        "success": final_success,
+        "status": "Completed"
+    })
 
-    total_success, total_sent, player_info = asyncio.run(send_until_20_success(
-        tokens, uid, server,
-        target_success=target_success
-    ))
-
-    if player_info:
-        player_info_response = {
-            "fail": target_success - total_success,
-            "level": player_info.get("level", 0),
-            "likes": player_info.get("likes", 0),
-            "nickname": player_info.get("nickname", ""),
-            "region": player_info.get("region", ""),
-            "success": total_success,
-            "uid": player_info.get("uid", 0)
-        }
-        return jsonify(player_info_response), 200
-    else:
-        return jsonify({"error": "Could not decode player information"}), 500
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5100)
+# টোকেন লোড এবং URL ফাংশন আপনার আগের কোড থেকে এখানে যোগ করবেন
