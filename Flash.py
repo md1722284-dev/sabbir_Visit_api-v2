@@ -1,74 +1,54 @@
-import asyncio
-import aiohttp
-import json
 from flask import Flask, jsonify
+import aiohttp
+import asyncio
 from byte import encrypt_api, Encrypt_ID
+# আপনার অন্যান্য ইমপোর্টগুলো ঠিক থাকবে...
 
 app = Flask(__name__)
 
-# সেমাফোর: একসাথে সর্বোচ্চ ৫০০টি রিকোয়েস্ট বের হবে (সার্ভার ভেদে ১০০০ পর্যন্ত করা যায়)
-MAX_CONCURRENT_REQUESTS = 500
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+# একসাথে ১০০টি করে রিকোয়েস্ট প্রসেস হবে (Vercel-এর জন্য পারফেক্ট)
+semaphore = asyncio.Semaphore(100)
 
 async def visit(session, url, token, uid, data):
     headers = {
         "ReleaseVersion": "OB53",
         "Authorization": f"Bearer {token}",
-        "Host": url.replace("https://", "").split("/")[0],
-        "Connection": "keep-alive" # কানেকশন ধরে রাখার জন্য
+        "Host": url.replace("https://", "").split("/")[0]
     }
-    async with semaphore: # সেমাফোর কন্ট্রোল
+    async with semaphore:
         try:
-            async with session.post(url, headers=headers, data=data, ssl=False, timeout=10) as resp:
+            # টাইমআউট ৫ সেকেন্ড রাখলে Vercel-এ এরর কম আসবে
+            async with session.post(url, headers=headers, data=data, ssl=False, timeout=5) as resp:
                 return resp.status == 200
         except:
             return False
 
-async def run_massive_visits(tokens, uid, server_name, target):
-    url = get_url(server_name)
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, ttl_dns_cache=300)
-    
-    # ডেটা একবারই এনক্রিপ্ট করুন (লুপের বাইরে)
-    encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
-    payload = bytes.fromhex(encrypted)
-    
-    total_success = 0
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # ৫০০০ করে ব্যাচে ভাগ করে কাজ করা (মেমোরি সেভ করার জন্য)
-        for i in range(0, target, 5000):
-            current_batch_size = min(5000, target - i)
-            tasks = []
-            
-            for j in range(current_batch_size):
-                token = tokens[(i + j) % len(tokens)]
-                tasks.append(visit(session, url, token, uid, payload))
-            
-            # ব্যাচ রান করা
-            results = await asyncio.gather(*tasks)
-            total_success += sum(1 for r in results if r)
-            
-            print(f"Progress: {total_success}/{target} visits done...")
-            
-    return total_success
-
-@app.route('/visit/<string:server>/<int:uid>/<int:count>')
-async def handle_request(server, uid, count):
-    # ১ লাখ ভিজিটের জন্য count প্যারামিটার ব্যবহার করুন
+@app.route('/<string:server>/<int:uid>')
+async def send_visits(server, uid):
     server = server.upper()
-    tokens = load_tokens(server)
+    tokens = load_tokens(server) # আপনার টোকেন লোড ফাংশন
     
     if not tokens:
         return jsonify({"error": "No tokens found"}), 500
 
-    # ব্যাকগ্রাউন্ডে কাজ শুরু করা (বড় রিকোয়েস্টের জন্য)
-    # নোট: ১ লাখের জন্য এটি কয়েক মিনিট সময় নেবে
-    final_success = await run_massive_visits(tokens, uid, server, count)
+    target = 1000  # এখানে আমরা ১০০০ লিমিট ফিক্সড করে দিলাম
+    url = get_url(server)
+    
+    # এনক্রিপশন লজিক
+    encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
+    data = bytes.fromhex(encrypted)
+
+    async with aiohttp.ClientSession() as session:
+        # ১০০০টি টাস্ক তৈরি করা হচ্ছে
+        tasks = [visit(session, url, tokens[i % len(tokens)], uid, data) for i in range(target)]
+        results = await asyncio.gather(*tasks)
+    
+    success_count = sum(1 for r in results if r)
     
     return jsonify({
+        "status": "Success",
         "uid": uid,
-        "target": count,
-        "success": final_success,
-        "status": "Completed"
+        "sent": target,
+        "success": success_count,
+        "fail": target - success_count
     })
-
-# টোকেন লোড এবং URL ফাংশন আপনার আগের কোড থেকে এখানে যোগ করবেন
